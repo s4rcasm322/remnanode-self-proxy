@@ -15,6 +15,7 @@ readonly SYSCTL_FILE="/etc/sysctl.d/99-remnawave-xhttp.conf"
 readonly SWAP_FILE="/swapfile"
 readonly REMNA_URL="https://github.com/DigneZzZ/remnawave-scripts/raw/main/remnanode.sh"
 readonly REMNA_NODE_PORT="2222"
+readonly INSTALLER_VERSION="6.0"
 
 DOMAIN=""
 CERT_DIR=""
@@ -56,116 +57,21 @@ prompt() {
 }
 
 
-apt_lock_owner_summary() {
-    local found=0
-    local lock
-
-    if command -v fuser >/dev/null 2>&1; then
-        for lock in \
-            /var/lib/dpkg/lock-frontend \
-            /var/lib/dpkg/lock \
-            /var/lib/apt/lists/lock \
-            /var/cache/apt/archives/lock
-        do
-            pids="$(fuser "${lock}" 2>/dev/null || true)"
-            if [[ -n "${pids//[[:space:]]/}" ]]; then
-                found=1
-                printf '    %s -> PID(s): %s\n' "${lock}" "${pids}"
-            fi
-        done
-
-        if (( ! found )); then
-            echo "    No APT/DPKG lock holders found."
-        fi
-
-        return 0
-    fi
-
-    ps -eo pid=,comm=,args= 2>/dev/null \
-        | awk '
-            /[a]pt-get|[d]pkg|[u]nattended-upgrade([^ -]|$)|[a]pt.systemd.daily/ {
-                print "    " $0
-            }
-        ' \
-        | head -n 10 || true
-}
-
-apt_is_busy() {
-    local lock
-
-    # Prefer the real package-manager lock files. If fuser exists, its result
-    # is authoritative: no lock holder = APT/DPKG is not busy.
-    #
-    # This intentionally ignores processes such as:
-    #   unattended-upgrade-shutdown --wait-for-signal
-    # which may live for the whole boot but do NOT hold the APT/DPKG locks.
-    if command -v fuser >/dev/null 2>&1; then
-        for lock in \
-            /var/lib/dpkg/lock-frontend \
-            /var/lib/dpkg/lock \
-            /var/lib/apt/lists/lock \
-            /var/cache/apt/archives/lock
-        do
-            if fuser "${lock}" >/dev/null 2>&1; then
-                return 0
-            fi
-        done
-
-        return 1
-    fi
-
-    # Fallback only for minimal systems where fuser is unavailable.
-    # Match actual package-manager processes, not the shutdown helper.
-    if pgrep -x apt-get >/dev/null 2>&1 \
-        || pgrep -x apt >/dev/null 2>&1 \
-        || pgrep -x dpkg >/dev/null 2>&1 \
-        || pgrep -f '(^|/)(unattended-upgrade)([[:space:]]|$)' >/dev/null 2>&1 \
-        || pgrep -f 'apt\.systemd\.daily' >/dev/null 2>&1
-    then
-        return 0
-    fi
-
-    return 1
-}
-
-wait_for_apt() {
-    local max_wait="${1:-1200}"
-    local interval=5
-    local waited=0
-
-    if ! apt_is_busy; then
-        return 0
-    fi
-
-    warn "APT/DPKG is currently busy (often first-boot updates or unattended-upgrades)."
-    echo "The installer will wait instead of deleting lock files or failing."
-    apt_lock_owner_summary
-
-    while apt_is_busy; do
-        if (( waited >= max_wait )); then
-            die "APT/DPKG remained busy for ${max_wait}s. Check the package-manager processes and rerun."
-        fi
-
-        printf '\rWaiting for APT/DPKG lock... %4ss / %4ss' "${waited}" "${max_wait}"
-        sleep "${interval}"
-        waited=$((waited + interval))
-    done
-
-    printf '\r%-70s\r' ""
-    ok "APT/DPKG lock is free."
-}
-
-run_apt() {
+run_pkg_command() {
     local tmp
     local rc
+    local started
+    local max_wait=1200
+    local retry_delay=5
     local attempt=1
-    local max_attempts=5
 
-    tmp="$(mktemp /tmp/liquidvpn-apt.XXXXXX.log)"
+    started="${SECONDS}"
 
-    while (( attempt <= max_attempts )); do
-        wait_for_apt 1200
+    while true; do
+        tmp="$(mktemp /tmp/liquidvpn-pkg.XXXXXX.log)"
 
+        # Run the REAL package-manager command. Do not try to infer whether APT
+        # is busy from process names or lock files beforehand.
         set +e
         "$@" 2>&1 | tee "${tmp}"
         rc=${PIPESTATUS[0]}
@@ -177,22 +83,43 @@ run_apt() {
         fi
 
         if grep -Eqi \
-            'Could not get lock|Unable to acquire.*lock|is another process using it|Could not open lock file' \
+            'Could not get lock|Unable to acquire.*lock|is held by process|is another process using it|Could not open lock file|Resource temporarily unavailable' \
             "${tmp}"
         then
-            warn "APT/DPKG lock race detected. Retrying (${attempt}/${max_attempts})..."
+            elapsed=$((SECONDS - started))
+
+            if (( elapsed >= max_wait )); then
+                warn "Package manager remained locked for ${max_wait}s."
+                cat "${tmp}" >&2 || true
+                rm -f "${tmp}"
+                return "${rc}"
+            fi
+
+            owner="$(
+                grep -Eio \
+                    'held by process[[:space:]]+[0-9]+([[:space:]]+\([^)]*\))?' \
+                    "${tmp}" \
+                    | head -n 1 \
+                    || true
+            )"
+
+            if [[ -n "${owner}" ]]; then
+                warn "Package manager is locked (${owner})."
+            else
+                warn "Package manager is temporarily locked."
+            fi
+
+            echo "Retrying in ${retry_delay}s... (${elapsed}s / ${max_wait}s)"
+            rm -f "${tmp}"
+            sleep "${retry_delay}"
             attempt=$((attempt + 1))
-            sleep 5
             continue
         fi
 
-        cat "${tmp}" >&2 || true
+        # Not a lock error: preserve the real error code and stop immediately.
         rm -f "${tmp}"
         return "${rc}"
     done
-
-    rm -f "${tmp}"
-    die "APT command could not acquire the package-manager lock after ${max_attempts} attempts."
 }
 
 cleanup() {
@@ -222,7 +149,7 @@ case "${ID:-}" in
         ;;
 esac
 
-log "LiquidVPN / RemnaNode installer"
+log "LiquidVPN / RemnaNode installer v${INSTALLER_VERSION}"
 
 while true; do
     prompt DOMAIN "Enter node domain (example: pl-node1.liquidvpn.org): "
@@ -285,25 +212,31 @@ fi
 
 export DEBIAN_FRONTEND=noninteractive
 
-log "Waiting for the package manager..."
-wait_for_apt 1200
-
 log "Updating package lists..."
-run_apt apt-get update
 
-# If a previous package operation was interrupted, finish pending package
-# configuration before installing anything else. We only do this after all
-# APT/DPKG locks are free.
-wait_for_apt 1200
-if ! dpkg --audit 2>/dev/null | grep -q .; then
-    :
-else
+# Ubuntu/Debian may run apt-daily/unattended-upgrades during first boot.
+# We let the actual apt-get command decide whether a lock exists and retry only
+# when apt-get itself reports a real lock conflict.
+run_pkg_command \
+    apt-get \
+    -o DPkg::Lock::Timeout=30 \
+    update
+
+# Repair an interrupted dpkg transaction if one exists.
+if dpkg --audit 2>/dev/null | grep -q .; then
     warn "DPKG reports unfinished package configuration. Repairing it first..."
-    DEBIAN_FRONTEND=noninteractive dpkg --configure -a
+
+    run_pkg_command \
+        env DEBIAN_FRONTEND=noninteractive \
+        dpkg --configure -a
 fi
 
 log "Installing required packages..."
-run_apt apt-get install -y \
+
+run_pkg_command \
+    apt-get \
+    -o DPkg::Lock::Timeout=30 \
+    install -y \
     nginx \
     certbot \
     ufw \

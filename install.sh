@@ -15,7 +15,8 @@ readonly SYSCTL_FILE="/etc/sysctl.d/99-remnawave-xhttp.conf"
 readonly SWAP_FILE="/swapfile"
 readonly REMNA_URL="https://github.com/DigneZzZ/remnawave-scripts/raw/main/remnanode.sh"
 readonly REMNA_NODE_PORT="2222"
-readonly INSTALLER_VERSION="6.0"
+readonly REMNA_COMPOSE="/opt/remnanode/docker-compose.yml"
+readonly INSTALLER_VERSION="6.1"
 
 DOMAIN=""
 CERT_DIR=""
@@ -56,11 +57,12 @@ prompt() {
     printf -v "$__var" '%s' "$__value"
 }
 
-
 run_pkg_command() {
     local tmp
     local rc
     local started
+    local elapsed
+    local owner
     local max_wait=1200
     local retry_delay=5
     local attempt=1
@@ -120,6 +122,111 @@ run_pkg_command() {
         rm -f "${tmp}"
         return "${rc}"
     done
+}
+
+configure_remnanode_hysteria() {
+    local compose="${REMNA_COMPOSE}"
+    local backup
+    local mount_state
+
+    [[ -f "${compose}" ]] || die "RemnaNode compose file was not found: ${compose}"
+    command -v docker >/dev/null 2>&1 || die "Docker is not available after RemnaNode installation."
+
+    log "Configuring RemnaNode Docker for Hysteria2..."
+
+    # RemnaNode should use host networking. This is required for inbound
+    # protocols such as Hysteria2 to bind directly to the host UDP ports.
+    if ! grep -Eq '^[[:space:]]*network_mode:[[:space:]]*host[[:space:]]*$' "${compose}"; then
+        die "RemnaNode compose does not use network_mode: host; refusing to patch unexpected layout."
+    fi
+
+    backup="${compose}.pre-hysteria.$(date +%Y%m%d-%H%M%S)"
+    cp -a "${compose}" "${backup}"
+
+    # Hysteria2 TLS configuration inside Xray needs access to the real
+    # Let's Encrypt files. Mount the WHOLE /etc/letsencrypt tree because
+    # files in /live are symlinks to /archive.
+    if grep -Fq '/etc/letsencrypt:/etc/letsencrypt:ro' "${compose}"; then
+        ok "Let's Encrypt certificates are already mounted into RemnaNode."
+    else
+        if grep -Eq '^    volumes:[[:space:]]*$' "${compose}"; then
+            # Existing active volumes section.
+            sed -i \
+                '/^    volumes:[[:space:]]*$/a\      - /etc/letsencrypt:/etc/letsencrypt:ro' \
+                "${compose}"
+
+        elif grep -Eq '^    #[[:space:]]*volumes:[[:space:]]*$' "${compose}"; then
+            # Official RemnaNode installer normally creates a commented
+            # volumes section for optional features. Reuse it instead of
+            # creating a second YAML "volumes" key.
+            sed -i \
+                's/^    #[[:space:]]*volumes:[[:space:]]*$/    volumes:/' \
+                "${compose}"
+
+            sed -i \
+                '/^    volumes:[[:space:]]*$/a\      - /etc/letsencrypt:/etc/letsencrypt:ro' \
+                "${compose}"
+
+        else
+            # Fallback for future compose layouts.
+            sed -i \
+                '/^[[:space:]]*network_mode:[[:space:]]*host[[:space:]]*$/i\
+    volumes:\
+      - /etc/letsencrypt:/etc/letsencrypt:ro' \
+                "${compose}"
+        fi
+    fi
+
+    log "Validating RemnaNode Docker Compose configuration..."
+
+    if ! (
+        cd /opt/remnanode
+        docker compose config >/dev/null
+    ); then
+        cp -a "${backup}" "${compose}"
+        die "Docker Compose validation failed after Hysteria2 changes; original compose restored."
+    fi
+
+    log "Recreating RemnaNode with Hysteria2 certificate access..."
+
+    if ! (
+        cd /opt/remnanode
+        docker compose up -d --force-recreate
+    ); then
+        cp -a "${backup}" "${compose}"
+
+        (
+            cd /opt/remnanode
+            docker compose up -d --force-recreate
+        ) || true
+
+        die "Failed to recreate RemnaNode; original compose restored."
+    fi
+
+    # Verify Docker actually applied the bind mount.
+    mount_state="$(
+        docker inspect remnanode \
+            --format '{{range .Mounts}}{{if eq .Destination "/etc/letsencrypt"}}{{.Source}}|{{.Destination}}|{{.RW}}{{end}}{{end}}' \
+            2>/dev/null \
+            || true
+    )"
+
+    if [[ "${mount_state}" == "/etc/letsencrypt|/etc/letsencrypt|false" ]]; then
+        ok "Let's Encrypt is mounted read-only inside RemnaNode."
+    else
+        warn "Expected Let's Encrypt bind mount was not found after container recreation."
+
+        cp -a "${backup}" "${compose}"
+
+        (
+            cd /opt/remnanode
+            docker compose up -d --force-recreate
+        ) || true
+
+        die "Hysteria2 Docker configuration verification failed; original compose restored."
+    fi
+
+    ok "RemnaNode Docker is ready for Hysteria2 on UDP/443."
 }
 
 cleanup() {
@@ -265,9 +372,10 @@ done
 
 ufw allow 80/tcp
 ufw allow 443/tcp
+ufw allow 443/udp
 ufw allow "${REMNA_NODE_PORT}/tcp"
 
-ok "SSH/HTTP/HTTPS/RemnaNode firewall rules staged. UFW has not been newly enabled yet."
+ok "SSH/HTTP/HTTPS/Hysteria2 UDP/RemnaNode firewall rules staged. UFW has not been newly enabled yet."
 
 # ------------------------------------------------------------------
 # sysctl / BBR
@@ -1077,8 +1185,10 @@ fi
 if [[ -n "${DOMAIN_AAAA}" ]]; then
     LOCAL_V6="$(ip -6 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | sort -u || true)"
     bad_v6=0
+
     while IFS= read -r dns_v6; do
         [[ -z "${dns_v6}" ]] && continue
+
         if ! grep -Fixq "${dns_v6}" <<<"${LOCAL_V6}"; then
             bad_v6=1
         fi
@@ -1087,6 +1197,7 @@ if [[ -n "${DOMAIN_AAAA}" ]]; then
     if (( bad_v6 )); then
         warn "DNS has an AAAA record that was not found on this server."
         warn "Let's Encrypt HTTP-01 validation may fail over IPv6."
+
         prompt IPV6_CONTINUE "Continue anyway? [y/N]: "
         [[ "${IPV6_CONTINUE:-N}" =~ ^[Yy]$ ]] || die "Fix/remove the incorrect AAAA record and rerun."
     fi
@@ -1100,6 +1211,7 @@ if [[ -s "${CERT_DIR}/fullchain.pem" && -s "${CERT_DIR}/privkey.pem" ]]; then
     ok "Certificate already exists for ${DOMAIN}; reusing it."
 else
     log "Obtaining Let's Encrypt certificate for ${DOMAIN}..."
+
     certbot certonly \
         --webroot \
         --webroot-path "${WEB_ROOT}" \
@@ -1185,9 +1297,20 @@ mkdir -p /etc/letsencrypt/renewal-hooks/deploy
 
 cat >/etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh <<'RENEW_EOF'
 #!/usr/bin/env bash
+
 set -Eeuo pipefail
+
 nginx -t
 systemctl reload nginx
+
+# Xray/Hysteria2 reads the certificate from the Let's Encrypt mount.
+# Restart RemnaNode after a successful renewal so the renewed certificate
+# is loaded immediately.
+if command -v docker >/dev/null 2>&1; then
+    if docker ps --format '{{.Names}}' 2>/dev/null | grep -Fxq 'remnanode'; then
+        docker restart remnanode >/dev/null
+    fi
+fi
 RENEW_EOF
 
 chmod 755 /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh
@@ -1211,10 +1334,12 @@ done
 
 ufw allow 80/tcp
 ufw allow 443/tcp
+ufw allow 443/udp
 ufw allow "${REMNA_NODE_PORT}/tcp"
 
 # Verify that at least one detected SSH listener is still present before enabling.
 ssh_listener_found=0
+
 for p in "${SSH_PORTS[@]}"; do
     if ss -H -lnt 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:|\])${p}$"; then
         ssh_listener_found=1
@@ -1255,6 +1380,10 @@ echo "[RemnaNode API port reserved]"
 echo "${REMNA_NODE_PORT}/tcp"
 
 echo
+echo "[Hysteria2]"
+echo "443/udp allowed"
+
+echo
 echo "[BBR]"
 sysctl net.core.default_qdisc || true
 sysctl net.ipv4.tcp_congestion_control || true
@@ -1283,6 +1412,7 @@ certbot certificates || true
 
 echo
 echo "[Internal HTTPS fallback]"
+
 if curl \
     --silent \
     --show-error \
@@ -1290,6 +1420,7 @@ if curl \
     --resolve "${DOMAIN}:9443:127.0.0.1" \
     "https://${DOMAIN}:9443/" \
     >/dev/null; then
+
     echo "127.0.0.1:9443: OK"
 else
     echo "127.0.0.1:9443: FAILED"
@@ -1305,12 +1436,16 @@ echo "nginx site: ${NGINX_SITE}"
 echo "Certificate: ${CERT_DIR}"
 echo "Fallback: 127.0.0.1:9443"
 echo "RemnaNode API port: ${REMNA_NODE_PORT}/tcp"
+echo "Hysteria2 port: 443/udp"
+
 echo
 echo "IMPORTANT:"
 echo "Keep this SSH session open and test a SECOND SSH connection before logging out."
+
 echo
 echo "All nginx / TLS / sysctl / swap / firewall work is finished."
 echo "RemnaNode will now be installed as the FINAL step."
+
 echo
 echo "The official RemnaNode installer follows Docker logs indefinitely."
 echo "After you see that RemnaNode and XRay are up and running, press Ctrl+C."
@@ -1346,9 +1481,11 @@ echo "============================================================"
 echo " STARTING OFFICIAL REMNANODE INSTALLER"
 echo "============================================================"
 echo "API port is preselected as: ${REMNA_NODE_PORT}"
+
 echo
 echo "When installation finishes, the upstream installer will attach to live logs."
 echo "Once the node is healthy, press Ctrl+C to leave the log view."
+echo "After that this installer will automatically configure Docker for Hysteria2."
 echo "============================================================"
 echo
 
@@ -1376,7 +1513,16 @@ else
     ok "RemnaNode installer returned normally."
 fi
 
-# Best-effort verification after the user leaves the live log stream.
+# ------------------------------------------------------------------
+# Hysteria2 Docker configuration
+# ------------------------------------------------------------------
+
+configure_remnanode_hysteria
+
+# ------------------------------------------------------------------
+# RemnaNode checks
+# ------------------------------------------------------------------
+
 if command -v docker >/dev/null 2>&1; then
     if docker ps --format '{{.Names}}' 2>/dev/null | grep -Fxq 'remnanode'; then
         ok "RemnaNode Docker container is running."
@@ -1392,20 +1538,34 @@ else
     warn "TCP port ${REMNA_NODE_PORT} is not currently visible as a host listener."
 fi
 
+if ufw status 2>/dev/null | grep -Eq '443/udp[[:space:]]+ALLOW'; then
+    ok "UDP port 443 is allowed by UFW."
+else
+    warn "Could not confirm the UFW allow rule for 443/udp."
+fi
+
 echo
 echo "============================================================"
 echo " INSTALLATION COMPLETED"
 echo "============================================================"
 echo "Domain: ${DOMAIN}"
 echo "RemnaNode API port: ${REMNA_NODE_PORT}/tcp"
+echo "Hysteria2 port: 443/udp"
+echo "Hysteria2 TLS directory: ${CERT_DIR}"
+echo "Docker certificate mount: /etc/letsencrypt:/etc/letsencrypt:ro"
 echo "Fallback: 127.0.0.1:9443"
+
 echo
 echo "Useful checks:"
 echo "  docker ps"
 echo "  cd /opt/remnanode && docker compose ps"
+echo "  cd /opt/remnanode && docker compose config"
 echo "  cd /opt/remnanode && docker compose logs --tail=100"
+echo "  docker inspect remnanode --format '{{json .Mounts}}'"
+echo "  ss -lunp | grep ':443 '"
 echo "  ufw status verbose"
 echo "  nginx -t"
+
 echo
 echo "Keep the current SSH session open until a second SSH connection succeeds."
 echo "============================================================"
